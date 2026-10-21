@@ -1,33 +1,38 @@
 #pragma once
+
 #include "imgui.h"
+#include "imfilebrowser.h" // Fourni via FetchContent de CMake
+#include <SDL3/SDL.h>
 #include <vector>
 #include <string>
 #include <algorithm>
 #include <optional>
 #include <memory>
+#include <iostream>
 
 #define DR_WAV_IMPLEMENTATION
-#include "dr_wav.h"
-
 #define DR_FLAC_IMPLEMENTATION
-#include "dr_flac.h"
-
 #define DR_MP3_IMPLEMENTATION
+
+// Inclusion des en-têtes dr_libs (Les implémentations se trouvent dans dr_libs.cpp)
+#include "dr_wav.h"
+#include "dr_flac.h"
 #include "dr_mp3.h"
 
+// Inclusion de nos modules de traitement SIMD/C++26 créés précédemment
 #include "TriggerBufferUpdate.hpp" 
 #include "CrossCorrelation26.hpp" 
 
-class AudioVisualizerWithTrigger {
+class AudioVisualizerWithTrigger 
+{
 private:
     std::vector<float> channelLeft;
     std::vector<float> channelRight;
     
     unsigned int sampleRate = 0;
-    size_t totalSampleCount = 0;
     unsigned int channelsCount = 0;
-
-    std::string currentFilePath = "Aucun fichier charge";
+    unsigned long long totalSampleCount = 0;
+    std::string currentFilePath = "Aucun fichier chargé";
     bool isAudioLoaded = false;
 
     std::unique_ptr<CorrelationTrigger> triggerLeft;
@@ -38,66 +43,19 @@ private:
     int samplesPerFrame = 441; 
     bool isPlaybackPaused = false;
 
+    // Paramètres gérés par l'interface ImGui
     int uiTsamp = 1024;  
     int uiStride = 1;    
 
-    void ReallocateTriggers() {
-        if (!isAudioLoaded) return;
-
-        if (uiTsamp < 2) uiTsamp = 2;
-        if (uiTsamp % 2 != 0) uiTsamp++;
-        if (uiStride < 1) uiStride = 1;
-
-        triggerLeft = std::make_unique<CorrelationTrigger>(uiTsamp, uiStride, samplesPerFrame, 0.5f, 0.3f, 1.0f);
-        triggerRight = std::make_unique<CorrelationTrigger>(uiTsamp, uiStride, samplesPerFrame, 0.5f, 0.3f, 1.0f);
-    }
-
-    void ProcessInterleavedFrames(const float* buffer, unsigned long long frameCount, unsigned int channels) {
-        channelLeft.clear();
-        channelRight.clear();
-        channelLeft.reserve(frameCount);
-        channelRight.reserve(frameCount);
-
-        for (unsigned long long i = 0; i < frameCount; ++i) {
-            if (channels >= 2) {
-                channelLeft.push_back(buffer[i * channels]);
-                channelRight.push_back(buffer[i * channels + 1]);
-            } else {
-                channelLeft.push_back(buffer[i]);
-                channelRight.push_back(buffer[i]);
-            }
-        }
-
-        isAudioLoaded = true;
-        currentPlaybackPos = 0;
-
-
-        CleanAudioStream(); // Fermer l'ancien flux si existant
-
-        // Spécification du format d'entrée (celui de dr_libs : float32, canaux d'origine, sample rate d'origine)
-        SDL_AudioSpec srcSpec = { SDL_AUDIO_F32, (int)channels, (int)sampleRate };
-        
-        // Demander à SDL3 d'ouvrir la sortie par défaut en adaptant automatiquement le format si nécessaire
-        audioStream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &srcSpec, nullptr, nullptr);
-        
-        if (audioStream) {
-            // Envoyer la totalité du morceau décodé dans le tampon de la carte son
-            SDL_PutAudioStreamData(audioStream, buffer, (int)(frameCount * channels * sizeof(float)));
-            
-            // Démarrer la lecture si la pause n'est pas active
-            if (!isPlaybackPaused) {
-                SDL_ResumeAudioStreamDevice(audioStream);
-            }
-        }
-
-        ReallocateTriggers();
-
-
-    }
-
+    // Moteur de streaming audio natif SDL3
     SDL_AudioStream* audioStream = nullptr;
 
-    // Ajoutez également cette petite méthode de nettoyage pour fermer la carte son proprement
+    // Instance du navigateur de fichiers ImGui
+    ImGui::FileBrowser fileDialog;
+
+    /**
+     * Ferme et détruit proprement le périphérique et le flux audio SDL3
+     */
     void CleanAudioStream() {
         if (audioStream) {
             SDL_DestroyAudioStream(audioStream);
@@ -105,18 +63,41 @@ private:
         }
     }
 
-public:
-    AudioVisualizerWithTrigger() = default;
+    /**
+     * Réalloue dynamiquement les déclencheurs de corrélation lors des changements de paramètres
+     */
+    void ReallocateTriggers() {
+        if (!isAudioLoaded) return;
+        
+        // Garantir les contraintes structurelles minimales
+        if (uiTsamp < 2) uiTsamp = 2;
+        if (uiTsamp % 2 != 0) uiTsamp++; // tsamp doit obligatoirement être pair (A = B = tsamp/2)
+        if (uiStride < 1) uiStride = 1;
 
-    ~AudioVisualizerWithTrigger() 
-    {
-    CleanAudioStream();
-    channelLeft.clear();
-    channelRight.clear();
+        triggerLeft = std::make_unique<CorrelationTrigger>(uiTsamp, uiStride, samplesPerFrame, 0.5f, 0.3f, 1.0f);
+        triggerRight = std::make_unique<CorrelationTrigger>(uiTsamp, uiStride, samplesPerFrame, 0.5f, 0.3f, 1.0f);
     }
+
+public:
+    AudioVisualizerWithTrigger() {
+        // Paramétrage de la boîte de dialogue d'imgui-filebrowser
+        fileDialog.SetTitle("Sélectionner un fichier audio");
+        fileDialog.SetTypeFilters({ ".wav", ".flac", ".mp3" });
+    }
+
+    ~AudioVisualizerWithTrigger() {
+        CleanAudioStream();
+        channelLeft.clear();
+        channelRight.clear();
+    }
+
+    /**
+     * Charge et décode un fichier audio universel (WAV, FLAC, MP3) en mémoire
+     */
     bool LoadAudioFile(const std::string& filename) {
         isAudioLoaded = false;
         currentFilePath = filename;
+        
         std::string ext = filename.substr(filename.find_last_of(".") + 1);
         std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
 
@@ -126,6 +107,7 @@ public:
             std::vector<float> tempBuffer(wav.totalPCMFrameCount * wav.channels);
             drwav_read_pcm_frames_f32(&wav, wav.totalPCMFrameCount, tempBuffer.data());
             sampleRate = wav.sampleRate;
+            channelsCount = wav.channels;
             totalSampleCount = wav.totalPCMFrameCount;
             ProcessInterleavedFrames(tempBuffer.data(), wav.totalPCMFrameCount, wav.channels);
             drwav_uninit(&wav);
@@ -137,6 +119,7 @@ public:
             std::vector<float> tempBuffer(pFlac->totalPCMFrameCount * pFlac->channels);
             drflac_read_pcm_frames_f32(pFlac, pFlac->totalPCMFrameCount, tempBuffer.data());
             sampleRate = pFlac->sampleRate;
+            channelsCount = pFlac->channels;
             totalSampleCount = pFlac->totalPCMFrameCount;
             ProcessInterleavedFrames(tempBuffer.data(), pFlac->totalPCMFrameCount, pFlac->channels);
             drflac_close(pFlac);
@@ -145,26 +128,67 @@ public:
         else if (ext == "mp3") {
             drmp3 mp3;
             if (!drmp3_init_file(&mp3, filename.c_str(), nullptr)) return false;
-
-            // CORRECTION ICI : Remplacer drmp3_get_total_pcm_frame_count par mp3.totalPCMFrameCount
             uint64_t totalFrames = mp3.totalPCMFrameCount; 
-
             std::vector<float> tempBuffer(totalFrames * mp3.channels);
             drmp3_read_pcm_frames_f32(&mp3, totalFrames, tempBuffer.data());
-
             sampleRate = mp3.sampleRate;
-            channelsCount = mp3.channels; // S'assurer que cette variable membre existe bien ou la déclarer localement
+            channelsCount = mp3.channels;
             totalSampleCount = totalFrames;
-
             ProcessInterleavedFrames(tempBuffer.data(), totalSampleCount, mp3.channels);
             drmp3_uninit(&mp3);
             return true;
         }
+        
+        currentFilePath = "Format non supporté";
         return false;
     }
 
+    /**
+     * Sépare les canaux entrelacés et initialise le périphérique de sortie audio SDL3
+     */
+    void ProcessInterleavedFrames(const float* buffer, unsigned long long frameCount, unsigned int channels) 
+    {
+        channelLeft.clear();
+        channelRight.clear();
+        channelLeft.reserve(frameCount);
+        channelRight.reserve(frameCount);
+
+        for (unsigned long long i = 0; i < frameCount; ++i) {
+            if (channels >= 2) {
+                channelLeft.push_back(buffer[i * channels]);
+                channelRight.push_back(buffer[i * channels + 1]);
+            } else { // Fichier Mono
+                channelLeft.push_back(buffer[i]);
+                channelRight.push_back(buffer[i]);
+            }
+        }
+
+        // Configuration matérielle de la lecture audio via SDL3
+        CleanAudioStream();
+        SDL_AudioSpec srcSpec = { SDL_AUDIO_F32, (int)channels, (int)sampleRate };
+        audioStream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &srcSpec, nullptr, nullptr);
+        
+        if (audioStream) {
+            // Remplir le tampon matériel et démarrer immédiatement le flux
+            SDL_PutAudioStreamData(audioStream, buffer, (int)(frameCount * channels * sizeof(float)));
+            if (!isPlaybackPaused) {
+                SDL_ResumeAudioStreamDevice(audioStream);
+            }
+        } else {
+            std::cerr << "Erreur d'ouverture du périphérique audio SDL3 : " << SDL_GetError() << std::endl;
+        }
+
+        isAudioLoaded = true;
+        currentPlaybackPos = 0;
+        ReallocateTriggers();
+    }
+
+    /**
+     * Génère l'analyse de synchronisation de phase et trace l'oscilloscope stabilisé
+     */
     void DrawTriggeredOscilloscope(const char* label, const std::vector<float>& channelData, 
-                                   CorrelationTrigger& triggerObj, ImVec2 size, ImU32 color) {
+                                   CorrelationTrigger& triggerObj, ImVec2 size, ImU32 color) 
+    {
         ImGui::Text("%s", label);
         ImVec2 p0 = ImGui::GetCursorScreenPos();
         ImVec2 p1 = ImVec2(p0.x + size.x, p0.y + size.y);
@@ -178,14 +202,12 @@ public:
             return;
         }
 
-        // 1. Appel au CorrelationTrigger pour trouver l'index aligné
+        // 1. Calcul du point d'accroche stable via le déclencheur de corrélation croisée
         TriggerResult tr = triggerObj.get_trigger(channelData, currentPlaybackPos, 120);
         int stableStartIndex = tr.trigger;
 
-        // 2. Préparation du cache pour la mise à jour dynamique du tampon
+        // 2. Traitement mathématique et mise à jour dynamique du tampon historique (TriggerBufferUpdate)
         CorrelationTrigger::PerFrameCache cache;
-        
-        // CORRECTION 1 : Le calcul de la moyenne et du buffer doit se faire sur la taille d'analyse 'uiTsamp'
         float sum = 0.0f;
         int count = 0;
         for (int i = 0; i < uiTsamp; ++i) {
@@ -196,9 +218,8 @@ public:
             }
         }
         cache.result_mean = (count > 0) ? (sum / count) : 0.0f;
-        cache.period = 40.0f; 
+        cache.period = 40.0f; // Valeur par défaut pour l'écart-type de la Gaussienne
 
-        // CORRECTION 2 : On alloue 'uiTsamp' éléments pour l'analyse mathématique du Trigger
         std::vector<float> mathSegment(uiTsamp, 0.0f);
         for (int i = 0; i < uiTsamp; ++i) {
             size_t idx = stableStartIndex + i;
@@ -206,12 +227,9 @@ public:
                 mathSegment[i] = channelData[idx];
             }
         }
-        // Cette fonction reçoit maintenant exactement un vecteur de taille uiTsamp. Plus de crash !
         triggerObj._update_buffer(mathSegment, cache);
 
-        // =================================================================
-        // 3. EXTRACTION SÉPARÉE POUR L'AFFICHAGE GRAPHIQUE (Zoom temporel)
-        // =================================================================
+        // 3. Rendu géométrique de la forme d'onde avec Downsampling Min/Max anti-aliasing
         int widthPixels = static_cast<int>(size.x);
         float samplesPerPixel = static_cast<float>(viewWindowSize) / size.x;
         float midY = p0.y + (size.y / 2.0f);
@@ -220,102 +238,70 @@ public:
             size_t startOffset = static_cast<size_t>(x * samplesPerPixel);
             size_t endOffset = static_cast<size_t>((x + 1) * samplesPerPixel);
 
-            float minVal = 1.0f;
-            float maxVal = -1.0f;
+            float minVal = 0.0f;
+            float maxVal = 0.0f;
+            bool hasData = false;
 
-            // On pioche directement dans channelData sur la longueur de viewWindowSize
             for (size_t s = startOffset; s < endOffset && s < static_cast<size_t>(viewWindowSize); ++s) {
                 size_t idx = stableStartIndex + s;
                 if (idx < channelData.size()) {
                     float val = channelData[idx];
-                    if (val < minVal) minVal = val;
-                    if (val > maxVal) maxVal = val;
+                    if (!hasData) { 
+                        minVal = maxVal = val; 
+                        hasData = true; 
+                    } else { 
+                        if (val < minVal) minVal = val; 
+                        if (val > maxVal) maxVal = val; 
+                    }
                 }
             }
 
-            if (minVal > maxVal) { minVal = 0.0f; maxVal = 0.0f; }
-
             float yTop = midY - (maxVal * (size.y / 2.0f));
             float yBottom = midY - (minVal * (size.y / 2.0f));
-
-            drawList->AddLine(ImVec2(p0.x + x, yTop), ImVec2(p0.x + x, yBottom), color, 1.2f);
+            drawList->AddLine(ImVec2(p0.x + x, yTop), ImVec2(p0.x + x, yBottom), color, 1.5f);
         }
-
         ImGui::Dummy(size);
     }
 
-
-
-    // Callback interne requis pour le File Dialog de SDL3
-    static void SDLCALL OnFileSelected(void* userdata, const char* const* filelist, int filter) {
-        auto* self = static_cast<AudioVisualizerWithTrigger*>(userdata);
-        if (filelist && filelist[0]) {
-            self->LoadAudioFile(filelist[0]);
-        }
-    }
-
-    void RenderUI() {
+    /**
+     * Construit et restitue la vue de l'interface utilisateur ImGui à chaque itération
+     */
+    void RenderUI() 
+    {
         ImGui::Begin("Oscilloscope Audio Synchronisé (SIMD Trigger)");
 
-        // =================================================================
-        // 1. EXPLORATEUR DE FICHIERS (FILE BROWSER NATIVE VIA SDL3)
-        // =================================================================
-        ImGui::Text("Fichier : %s", currentFilePath.c_str());
+        // Explorateur de fichiers
+        ImGui::Text("Fichier actuel : %s", currentFilePath.c_str());
         ImGui::SameLine();
-        
         if (ImGui::Button("Parcourir...")) {
-            // Configuration des filtres de fichiers pour SDL3
-            const SDL_DialogFileFilter filters[] = {
-                { "Fichiers Audio (.wav, .flac, .mp3)", "wav;flac;mp3" },
-                { "Tous les fichiers", "*" }
-            };
-            
-            // Appel non-bloquant du File Dialog natif de SDL3
-            SDL_ShowOpenFileDialog(OnFileSelected, this, nullptr, filters, 1, nullptr, false);
+            fileDialog.Open();
         }
 
         ImGui::Separator();
 
         if (isAudioLoaded) {
+            // Informations fichier
+            ImGui::Text("Fréquence : %u Hz | Canaux : %u | Taille : %llu échantillons",
+                        sampleRate, channelsCount, totalSampleCount);
 
-            // =================================================================
-            // 2. SLIDERS DYNAMIQUES POUR LES PARAMÈTRES (441, 1024, 1)
-            // =================================================================
-            if (ImGui::CollapsingHeader("Paramètres du Moteur Temporel & Déclencheur", ImGuiTreeNodeFlags_DefaultOpen)) {
-                bool parametersChanged = false;
-
-                // Slider pour l'avance de trame (Anciennement 441 codé en dur)
-                if (ImGui::SliderInt("Avance par Image (Trame)", &samplesPerFrame, 64, 2048, "%d samples")) {
-                    parametersChanged = true;
-                }
-                ImGui::SameLine(); ImGui::TextDisabled("(Défaut: 441)");
-
-                // Slider pour la taille d'analyse tsamp (Anciennement 1024 codé en dur)
+            // --- CURSEURS INTERACTIFS DES PARAMÈTRES (441, 1024, 1) ---
+            if (ImGui::CollapsingHeader("Configuration Avancée du Déclencheur", ImGuiTreeNodeFlags_DefaultOpen)) {
+                bool triggerParamsChanged = false;
+                if (ImGui::SliderInt("Avance par Image", &samplesPerFrame, 64, 2048, "%d samples")) triggerParamsChanged = true;
                 if (ImGui::SliderInt("Taille Analyse (tsamp)", &uiTsamp, 128, 4096, "%d samples")) {
-                    // Contrainte algorithmique : forcer une valeur paire
                     if (uiTsamp % 2 != 0) uiTsamp++;
-                    parametersChanged = true;
+                    triggerParamsChanged = true;
                 }
-                ImGui::SameLine(); ImGui::TextDisabled("(Défaut: 1024)");
+                if (ImGui::SliderInt("Sous-échantillonnage (stride)", &uiStride, 1, 8, "1/%d")) triggerParamsChanged = true;
 
-                // Slider pour le sous-échantillonnage stride (Anciennement 1 codé en dur)
-                if (ImGui::SliderInt("Sous-échantillonnage (stride)", &uiStride, 1, 8, "1/%d")) {
-                    parametersChanged = true;
-                }
-                ImGui::SameLine(); ImGui::TextDisabled("(Défaut: 1)");
-
-                // Si l'utilisateur manipule un des 3 sliders, on réalloue les buffers du déclencheur à la volée
-                if (parametersChanged) {
+                if (triggerParamsChanged) {
                     ReallocateTriggers();
                 }
             }
 
             ImGui::Separator();
 
-            // =================================================================
-            // 3. CONTRÔLES DE LECTURE ET OSCILLOSCOPES
-            // =================================================================
-            // --- CONTRÔLES DE LECTURE MODIFIÉS ---
+            // --- CONTRÔLES DE LECTURE AUDIO ---
             if (ImGui::Button(isPlaybackPaused ? "Reprendre" : "Pause")) {
                 isPlaybackPaused = !isPlaybackPaused;
                 if (audioStream) {
@@ -326,46 +312,48 @@ public:
             ImGui::SameLine();
             if (ImGui::Button("Reset Position")) {
                 currentPlaybackPos = 0;
-                if (audioStream) SDL_ClearAudioStream(audioStream); 
-                // Note : Pour un vrai Seek complet, il faudrait re-Put les données, 
-                // mais Clear permet déjà de couper le son instantanément pour le reset.
             }
 
-            // --- SYNCHRONISATION TECHNIQUE DE L'OSCILLOSCOPE ---
-            if (!isPlaybackPaused && audioStream) 
-            {
-                // Au lieu de faire "+= samplesPerFrame", on demande à SDL combien d'octets 
-                // ont déjà été consommés/joués par les haut-parleurs
-                int queuedBytes = SDL_GetAudioStreamQueued(audioStream);
-                int totalBytesInFile = totalSampleCount * channelsCount * sizeof(float);
-                int playedBytes = totalBytesInFile - queuedBytes;
-                
-                if (playedBytes > 0) {
-                    currentPlaybackPos = (playedBytes / sizeof(float)) / channelsCount;
-                }
-
-                if (queuedBytes == 0) {
-                    currentPlaybackPos = 0; // Boucler visuellement si le morceau est fini
+            // Avancement de la tête de lecture selon le timing matériel
+            if (!isPlaybackPaused) {
+                currentPlaybackPos += samplesPerFrame;
+                // CORRECTION 1 : Ajout de <int> pour le static_cast
+                if (currentPlaybackPos >= static_cast<int>(channelLeft.size())) {
+                    currentPlaybackPos = 0; // Boucler au début du fichier
                 }
             }
 
-            ImGui::SliderInt("Fenêtre d'affichage (Zoom)", &viewWindowSize, 256, 4096);
-            
+            // Slider de Zoom et barre de progression
+            ImGui::SliderInt("Fenêtre d'affichage (Zoom)", &viewWindowSize, 256, 4096, "%d samples");
+
+            // CORRECTION 2 : Ajout de <float> pour le static_cast
             float progress = static_cast<float>(currentPlaybackPos) / channelLeft.size();
             ImGui::ProgressBar(progress, ImVec2(-1.0f, 0.0f));
 
-            // Rendu des deux oscilloscopes géométriques stabilisés
+            // Rendu graphique des canaux séparés Gauche / Droite
             ImVec2 widgetSize(ImGui::GetContentRegionAvail().x, 160.0f);
-
             ImGui::Spacing();
-            DrawTriggeredOscilloscope("Canal GAUCHE (L) - Stabilisé", channelLeft, *triggerLeft, widgetSize, IM_COL32(0, 255, 200, 255));
-            
+            DrawTriggeredOscilloscope("Canal GAUCHE (L) - Stabilisé via SIMD", channelLeft, *triggerLeft, widgetSize, IM_COL32(0, 255, 200, 255));
             ImGui::Spacing();
-            DrawTriggeredOscilloscope("Canal DROIT (R) - Stabilisé", channelRight, *triggerRight, widgetSize, IM_COL32(255, 180, 0, 255));
+            DrawTriggeredOscilloscope("Canal DROIT (R) - Stabilisé via SIMD", channelRight, *triggerRight, widgetSize, IM_COL32(255, 180, 0, 255));
         } else {
-            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.3f, 1.0f), "Veuillez ouvrir un fichier pour configurer le défilement des phases.");
+            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.3f, 1.0f), "Veuillez charger un fichier pour démarrer l'analyse de phase.");
         }
 
         ImGui::End();
+
+        // Rendu impératif et gestion de la sélection d'imgui-filebrowser
+        fileDialog.Display();
+        if (fileDialog.HasSelected()) {
+            LoadAudioFile(fileDialog.GetSelected().string());
+            fileDialog.ClearSelected();
+        }
     }
+
 };
+
+
+
+
+
+

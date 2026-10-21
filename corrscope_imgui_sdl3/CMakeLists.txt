@@ -33,11 +33,15 @@ FetchContent_Declare(
 # Récupération du contenu du dépôt
 FetchContent_MakeAvailable(imgui)
 
-# ---------------------------------------------------------------------
-# Configuration des fichiers du projet
-# ---------------------------------------------------------------------
+FetchContent_Declare(
+    imgui_filebrowser
+    GIT_REPOSITORY https://github.com/AirGuanZ/imgui-filebrowser.git
+    GIT_TAG        master
+)
 
-# On crée une bibliothèque intermédiaire pour compiler proprement les sources d'ImGui
+FetchContent_MakeAvailable(imgui imgui_filebrowser)
+
+# Création de la bibliothèque intermédiaire d'ImGui
 add_library(imgui_lib STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_demo.cpp
@@ -48,12 +52,14 @@ add_library(imgui_lib STATIC
     ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
 )
 
-# Configuration des inclusions et liaisons de cette bibliothèque tierce
+# On indique à CMake où trouver imfilebrowser.h ainsi que les headers imgui
 target_include_directories(imgui_lib PUBLIC 
     ${imgui_SOURCE_DIR} 
     ${imgui_SOURCE_DIR}/backends
+    ${imgui_filebrowser_SOURCE_DIR} # <-- Ajout du dossier d'inclusion du filebrowser
 )
 target_link_libraries(imgui_lib PRIVATE SDL3::SDL3 OpenGL::GL)
+
 
 # ---------------------------------------------------------------------
 # Cible principale (Votre exécutable)
