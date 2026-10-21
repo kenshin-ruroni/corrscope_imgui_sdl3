@@ -24,6 +24,7 @@
 
 #include "TriggerBufferUpdate.hpp" 
 #include "CrossCorrelation26.hpp" 
+#include "NodalReverbProcessor.hpp" 
 
 // Structure pour stocker l'historique et les métadonnées des morceaux chargés
 struct AudioTrack {
@@ -53,7 +54,23 @@ class AudioVisualizerWithTrigger {
 private:
     std::vector<float> channelLeft;
     std::vector<float> channelRight;
-    
+
+    // Instances du processeur de réverbération nodale pour la stéréo
+    std::unique_ptr<NodalReverbProcessor> reverbLeft;
+    std::unique_ptr<NodalReverbProcessor> reverbRight;
+
+    // Variables pour la Combo Box d'ImGui
+    int selectedEffectIndex = 0; // 0 = Aucun, 1 = Reverb Filter
+    const char* effectNames[2] = { "Aucun", "Reverb Filter (Nodal Analysis)" };
+
+    // Sauvegarde du buffer d'origine pour pouvoir réinitialiser le signal ou changer d'effet à la volée
+    std::vector<float> originalInterleavedBuffer;
+    std::vector<float> currentProcessedBuffer; 
+
+    // Variables de synchronisation d'horloge absolue (Anti-dérive temporelle)
+    double m_timeOffsetSeconds = 0.0; 
+    uint64_t m_startTicks = 0;  
+
     unsigned int sampleRate = 0;
     unsigned int channelsCount = 0;
     unsigned long long totalSampleCount = 0;
@@ -217,6 +234,11 @@ public:
     AudioVisualizerWithTrigger() {
         fileDialog.SetTitle("Ajouter un morceau à la liste");
         fileDialog.SetTypeFilters({ ".wav", ".flac", ".mp3" });
+    
+        // Instanciation par défaut des processeurs nodaux (~80ms de délai asymétrique pour élargir la stéréo)
+        reverbLeft = std::make_unique<NodalReverbProcessor>(3500, 0.65f);
+        reverbRight = std::make_unique<NodalReverbProcessor>(3850, 0.65f);
+
     }
 
     ~AudioVisualizerWithTrigger() {
@@ -249,40 +271,67 @@ public:
         return true;
     }
 
+
     void ProcessInterleavedFrames(const float* buffer, unsigned long long frameCount, unsigned int channels, const AudioTrack& track) 
     {
+        originalInterleavedBuffer.assign(buffer, buffer + (frameCount * channels));
+        
         channelLeft.clear();
         channelRight.clear();
         channelLeft.reserve(frameCount);
         channelRight.reserve(frameCount);
 
-        for (unsigned long long i = 0; i < frameCount; ++i) {
-            if (channels >= 2) {
-                channelLeft.push_back(buffer[i * channels]);
-                channelRight.push_back(buffer[i * channels + 1]);
-            } else {
-                channelLeft.push_back(buffer[i]);
-                channelRight.push_back(buffer[i]);
-            }
-        }
+        currentProcessedBuffer = originalInterleavedBuffer;
 
+        reverbLeft->ResetNodalCircuit();
+        reverbRight->ResetNodalCircuit();
+
+        if (selectedEffectIndex == 1) {
+            if (channels >= 2) {
+                std::vector<float> tempLeft(frameCount);
+                std::vector<float> tempRight(frameCount);
+                for (unsigned long long i = 0; i < frameCount; ++i) {
+                    tempLeft[i] = currentProcessedBuffer[i * channels];
+                    tempRight[i] = currentProcessedBuffer[i * channels + 1];
+                }
+
+        reverbLeft->ProcessNodalBufferSIMD(tempLeft.data(), frameCount);
+        reverbRight->ProcessNodalBufferSIMD(tempRight.data(), frameCount);
+        for (unsigned long long i = 0; i < frameCount; ++i) {
+        currentProcessedBuffer[i * channels] = tempLeft[i];
+        currentProcessedBuffer[i * channels + 1] = tempRight[i];
+        }
+        } else {
+        reverbLeft->ProcessNodalBufferSIMD(currentProcessedBuffer.data(), frameCount);
+        }
+        }
+        for (unsigned long long i = 0; i < frameCount; ++i) {
+        if (channels >= 2) {
+        channelLeft.push_back(currentProcessedBuffer[i * channels]);
+        channelRight.push_back(currentProcessedBuffer[i * channels + 1]);
+        } else {
+        channelLeft.push_back(currentProcessedBuffer[i]);
+        }
+        }
         CleanAudioStream();
         sampleRate = track.sampleRate;
         channelsCount = track.channels;
         totalSampleCount = track.totalFrames;
-
         SDL_AudioSpec srcSpec = { SDL_AUDIO_F32, (int)channels, (int)sampleRate };
         audioStream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &srcSpec, nullptr, nullptr);
-        
-        if (audioStream) 
-        {
-            SDL_PutAudioStreamData(audioStream, buffer, (int)(frameCount * channels * sizeof(float)));
-            if (!isPlaybackPaused) SDL_ResumeAudioStreamDevice(audioStream);
+        if (audioStream) {
+        SDL_PutAudioStreamData(audioStream, currentProcessedBuffer.data(), (int)(currentProcessedBuffer.size() * sizeof(float)));
+        if (!isPlaybackPaused) SDL_ResumeAudioStreamDevice(audioStream);
         }
         isAudioLoaded = true;
         currentPlaybackPos = 0;
+        m_timeOffsetSeconds = 0.0;
+        m_startTicks = SDL_GetTicks(); // Initialiser l'horloge au départ
         ReallocateTriggers();
     }
+
+
+
     void DrawTriggeredOscilloscope(const char* label, const std::vector<float>& channelData, 
                                    CorrelationTrigger& triggerObj, ImVec2 size, ImU32 color) {
         ImGui::Text("%s", label);
@@ -422,6 +471,82 @@ public:
             }
 
             ImGui::Separator();
+
+        // =================================================================
+        // SÉLECTEUR D'EFFETS TEMPS RÉEL (COMBO BOX IMGUI)
+        // =================================================================
+        ImGui::Text("Effet DSP Audio (Analyse Nodale) :");
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5f);
+        
+
+            if (ImGui::Combo("##EffectCombo", &selectedEffectIndex, effectNames, 2)) {
+                if (!originalInterleavedBuffer.empty() && sampleRate > 0 && audioStream) {
+                    // 1. Sauvegarder la position de lecture actuelle (en secondes et en échantillons)
+                    double currentPositionInSeconds = static_cast<double>(currentPlaybackPos) / sampleRate;
+                    int savedPlaybackPos = currentPlaybackPos;
+                    bool wasPaused = isPlaybackPaused;
+
+                    // 2. Recalculer instantanément l'effet en RAM sur l'intégralité du buffer
+                    currentProcessedBuffer = originalInterleavedBuffer;
+                    reverbLeft->ResetNodalCircuit();
+                    reverbRight->ResetNodalCircuit();
+
+                    unsigned long long frameCount = totalSampleCount;
+                    if (selectedEffectIndex == 1) {
+                        if (channelsCount >= 2) {
+                            std::vector<float> tempLeft(frameCount);
+                            std::vector<float> tempRight(frameCount);
+                            for (unsigned long long i = 0; i < frameCount; ++i) {
+                                tempLeft[i] = currentProcessedBuffer[i * channelsCount];
+                                tempRight[i] = currentProcessedBuffer[i * channelsCount + 1];
+                            }
+                            reverbLeft->ProcessNodalBufferSIMD(tempLeft.data(), frameCount);
+                            reverbRight->ProcessNodalBufferSIMD(tempRight.data(), frameCount);
+                            for (unsigned long long i = 0; i < frameCount; ++i) {
+                                currentProcessedBuffer[i * channelsCount] = tempLeft[i];
+                                currentProcessedBuffer[i * channelsCount + 1] = tempRight[i];
+                            }
+                        } else {
+                            reverbLeft->ProcessNodalBufferSIMD(currentProcessedBuffer.data(), frameCount);
+                        }
+                    }
+
+                    // 3. Mettre à jour les canaux des oscilloscopes graphiques sans déplacer l'index
+                    channelLeft.clear();
+                    channelRight.clear();
+                    for (unsigned long long i = 0; i < frameCount; ++i) {
+                        if (channelsCount >= 2) {
+                            channelLeft.push_back(currentProcessedBuffer[i * channelsCount]);
+                            channelRight.push_back(currentProcessedBuffer[i * channelsCount + 1]);
+                        } else {
+                            channelLeft.push_back(currentProcessedBuffer[i]);
+                        }
+                    }
+
+                    // 4. NETTOYAGE ET RE-REMPLISSAGE DU FLUX SANS DESTRUCTION DE LA CARTE SON
+                    SDL_ClearAudioStream(audioStream); // Vide la file d'attente binaire matérielle [2]
+
+                    // Calcul du décalage mémoire exact pour la reprise
+                    size_t sampleOffset = static_cast<size_t>(savedPlaybackPos) * channelsCount;
+                    size_t remainingSamples = currentProcessedBuffer.size() - sampleOffset;
+
+                    if (sampleOffset < currentProcessedBuffer.size()) {
+                        // Ré-injecter uniquement le reliquat du signal filtré dans le flux existant [2]
+                        SDL_PutAudioStreamData(audioStream, &currentProcessedBuffer[sampleOffset], (int)(remainingSamples * sizeof(float)));
+                    }
+
+                    // 5. AJUSTEMENT DE L'HORLOGE POUR COMPENSER LA RAZ DE SDL3
+                    // On fige le décalage sur la position de sauvegarde pour empêcher le retour à 0
+                    m_timeOffsetSeconds = currentPositionInSeconds;
+                    m_startTicks = SDL_GetTicks(); // Relancer le chronomètre de référence à cette frame
+                    currentPlaybackPos = savedPlaybackPos;
+                }
+            }
+
+
+
+        ImGui::Separator();
+
 
             // --- CONTRÔLES DE LECTURE ---
             if (ImGui::Button(isPlaybackPaused ? "Reprendre" : "Pause")) {
