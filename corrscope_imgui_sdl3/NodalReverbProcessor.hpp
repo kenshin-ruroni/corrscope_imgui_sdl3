@@ -107,4 +107,19 @@ public:
         }
         m_feedbackGain = std::clamp(feedback, 0.0f, 0.99f);
     }
+
+        /**
+     * Modifie dynamiquement la longueur de la ligne de retard (m_delaySamples)
+     * et réalloue proprement le tampon de l'analyse nodale.
+     */
+    void UpdateDelaySamples(int newDelay) 
+    {
+        if (newDelay < 1) newDelay = 1;
+        if (newDelay != m_delaySamples) {
+            m_delaySamples = newDelay;
+            m_delayLine.assign(m_delaySamples, 0.0f); // Réallocation et purge
+            m_readIndex = 0;
+            m_writeIndex = 0;
+        }
+    }
 };
