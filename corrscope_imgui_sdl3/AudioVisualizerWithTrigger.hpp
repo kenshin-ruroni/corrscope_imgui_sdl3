@@ -1,7 +1,7 @@
 #pragma once
 
 #include "imgui.h"
-#include "imfilebrowser.h" // Fourni via FetchContent de CMake
+#include "imfilebrowser.h"
 #include <SDL3/SDL.h>
 #include <vector>
 #include <string>
@@ -9,22 +9,47 @@
 #include <optional>
 #include <memory>
 #include <iostream>
+#include <iomanip>
+#include <sstream>
+#include <thread>  // AJOUT : Pour la gestion du Threading
+#include <atomic> 
 
 #define DR_WAV_IMPLEMENTATION
 #define DR_FLAC_IMPLEMENTATION
 #define DR_MP3_IMPLEMENTATION
 
-// Inclusion des en-têtes dr_libs (Les implémentations se trouvent dans dr_libs.cpp)
 #include "dr_wav.h"
 #include "dr_flac.h"
 #include "dr_mp3.h"
 
-// Inclusion de nos modules de traitement SIMD/C++26 créés précédemment
 #include "TriggerBufferUpdate.hpp" 
 #include "CrossCorrelation26.hpp" 
 
-class AudioVisualizerWithTrigger 
-{
+// Structure pour stocker l'historique et les métadonnées des morceaux chargés
+struct AudioTrack {
+    std::string filePath;
+    std::string fileName;
+    unsigned int sampleRate = 0;
+    unsigned int channels = 0;
+    unsigned int bitDepth = 0; // 0 pour le MP3 (débit variable)
+    unsigned long long totalFrames = 0;
+    std::string durationStr;
+
+    // Calcule la chaîne de caractères au format mm:ss
+    void ComputeDurationString() {
+        if (sampleRate == 0) { durationStr = "00:00"; return; }
+        unsigned long long totalSeconds = totalFrames / sampleRate;
+        unsigned int minutes = static_cast<unsigned int>(totalSeconds / 60);
+        unsigned int seconds = static_cast<unsigned int>(totalSeconds % 60);
+        
+        std::stringstream ss;
+        ss << std::setw(2) << std::setfill('0') << minutes << ":"
+           << std::setw(2) << std::setfill('0') << seconds;
+        durationStr = ss.str();
+    }
+};
+
+class AudioVisualizerWithTrigger {
 private:
     std::vector<float> channelLeft;
     std::vector<float> channelRight;
@@ -43,19 +68,20 @@ private:
     int samplesPerFrame = 441; 
     bool isPlaybackPaused = false;
 
-    // Paramètres gérés par l'interface ImGui
     int uiTsamp = 1024;  
     int uiStride = 1;    
 
-    // Moteur de streaming audio natif SDL3
     SDL_AudioStream* audioStream = nullptr;
-
-    // Instance du navigateur de fichiers ImGui
     ImGui::FileBrowser fileDialog;
 
-    /**
-     * Ferme et détruit proprement le périphérique et le flux audio SDL3
-     */
+    std::vector<AudioTrack> playlist;
+    int selectedTrackIndex = -1;
+
+    // --- VARIABLES DE THREADING ET CHARGEMENT ---
+    std::thread loadingThread;
+    std::atomic<bool> isFileLoading{false};
+    std::string lastLoadingError = "";
+
     void CleanAudioStream() {
         if (audioStream) {
             SDL_DestroyAudioStream(audioStream);
@@ -63,90 +89,167 @@ private:
         }
     }
 
-    /**
-     * Réalloue dynamiquement les déclencheurs de corrélation lors des changements de paramètres
-     */
     void ReallocateTriggers() {
         if (!isAudioLoaded) return;
-        
-        // Garantir les contraintes structurelles minimales
         if (uiTsamp < 2) uiTsamp = 2;
-        if (uiTsamp % 2 != 0) uiTsamp++; // tsamp doit obligatoirement être pair (A = B = tsamp/2)
+        if (uiTsamp % 2 != 0) uiTsamp++;
         if (uiStride < 1) uiStride = 1;
 
         triggerLeft = std::make_unique<CorrelationTrigger>(uiTsamp, uiStride, samplesPerFrame, 0.5f, 0.3f, 1.0f);
         triggerRight = std::make_unique<CorrelationTrigger>(uiTsamp, uiStride, samplesPerFrame, 0.5f, 0.3f, 1.0f);
     }
 
+    /**
+     * Cœur binaire de l'ancien LoadAudioFile, s'exécutant désormais de façon asynchrone
+     */
+    void InternalLoadTrack(const std::string filename) {
+        std::string ext = filename.substr(filename.find_last_of(".") + 1);
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+
+        AudioTrack track;
+        track.filePath = filename;
+        track.fileName = filename.substr(filename.find_last_of("/\\") + 1);
+
+        if (ext == "wav") {
+            drwav wav;
+            if (!drwav_init_file(&wav, filename.c_str(), nullptr)) {
+                lastLoadingError = "Impossible d'initialiser le fichier WAV.";
+                isFileLoading = false;
+                return;
+            }
+            if (wav.totalPCMFrameCount == 0 || wav.channels == 0 || wav.totalPCMFrameCount > 600000000ULL) {
+                lastLoadingError = "Taille WAV invalide ou corrompue.";
+                drwav_uninit(&wav);
+                isFileLoading = false;
+                return;
+            }
+
+            std::vector<float> tempBuffer(wav.totalPCMFrameCount * wav.channels);
+            drwav_read_pcm_frames_f32(&wav, wav.totalPCMFrameCount, tempBuffer.data());
+            
+            track.sampleRate = wav.sampleRate;
+            track.channels = wav.channels;
+            track.bitDepth = wav.bitsPerSample;
+            track.totalFrames = wav.totalPCMFrameCount;
+            track.ComputeDurationString();
+
+            ProcessInterleavedFrames(tempBuffer.data(), wav.totalPCMFrameCount, wav.channels, track);
+            drwav_uninit(&wav);
+        } 
+        else if (ext == "flac") {
+            drflac* pFlac = drflac_open_file(filename.c_str(), nullptr);
+            if (!pFlac) {
+                lastLoadingError = "Impossible d'ouvrir le fichier FLAC.";
+                isFileLoading = false;
+                return;
+            }
+            unsigned long long flacFrames = pFlac->totalPCMFrameCount;
+            if (flacFrames == 0 || pFlac->channels == 0 || flacFrames > 600000000ULL) {
+                lastLoadingError = "Taille FLAC invalide ou en dehors des limites.";
+                drflac_close(pFlac);
+                isFileLoading = false;
+                return;
+            }
+
+            std::vector<float> tempBuffer(flacFrames * pFlac->channels);
+            drflac_read_pcm_frames_f32(pFlac, flacFrames, tempBuffer.data());
+            
+            track.sampleRate = pFlac->sampleRate;
+            track.channels = pFlac->channels;
+            track.bitDepth = pFlac->bitsPerSample;
+            track.totalFrames = flacFrames;
+            track.ComputeDurationString();
+
+            ProcessInterleavedFrames(tempBuffer.data(), flacFrames, pFlac->channels, track);
+            drflac_close(pFlac);
+        }
+        else if (ext == "mp3") {
+            drmp3 mp3;
+            if (!drmp3_init_file(&mp3, filename.c_str(), nullptr)) {
+                lastLoadingError = "Impossible d'initialiser le fichier MP3.";
+                isFileLoading = false;
+                return;
+            }
+            
+            uint64_t totalFrames = drmp3_get_pcm_frame_count(&mp3); 
+            if (totalFrames == 0 || mp3.channels == 0 || totalFrames > 600000000ULL) {
+                lastLoadingError = "Taille MP3 invalide ou scan corrompu.";
+                drmp3_uninit(&mp3);
+                isFileLoading = false;
+                return;
+            }
+
+            std::vector<float> tempBuffer(totalFrames * mp3.channels);
+            drmp3_read_pcm_frames_f32(&mp3, totalFrames, tempBuffer.data());
+            
+            track.sampleRate = mp3.sampleRate;
+            track.channels = mp3.channels;
+            track.bitDepth = 0; 
+            track.totalFrames = totalFrames;
+            track.ComputeDurationString();
+
+            ProcessInterleavedFrames(tempBuffer.data(), totalFrames, mp3.channels, track);
+            drmp3_uninit(&mp3);
+        } else {
+            lastLoadingError = "Format d'extension non supporté.";
+            isFileLoading = false;
+            return;
+        }
+
+        // Section critique : Injection sécurisée dans la playlist principale
+        auto it = std::find_if(playlist.begin(), playlist.end(), [&](const AudioTrack& t) {
+            return t.filePath == filename;
+        });
+        if (it == playlist.end()) {
+            playlist.push_back(track);
+            selectedTrackIndex = static_cast<int>(playlist.size()) - 1;
+        } else {
+            selectedTrackIndex = static_cast<int>(std::distance(playlist.begin(), it));
+        }
+
+        currentFilePath = track.fileName;
+        
+        // Indiquer la fin définitive de l'accès au thread de chargement
+        isFileLoading = false; 
+    }
+
 public:
     AudioVisualizerWithTrigger() {
-        // Paramétrage de la boîte de dialogue d'imgui-filebrowser
-        fileDialog.SetTitle("Sélectionner un fichier audio");
+        fileDialog.SetTitle("Ajouter un morceau à la liste");
         fileDialog.SetTypeFilters({ ".wav", ".flac", ".mp3" });
     }
 
     ~AudioVisualizerWithTrigger() {
+        // Sécurité : Attendre l'arrêt du thread en cas de fermeture brutale de la fenêtre
+        if (loadingThread.joinable()) {
+            loadingThread.join();
+        }
         CleanAudioStream();
         channelLeft.clear();
         channelRight.clear();
     }
 
     /**
-     * Charge et décode un fichier audio universel (WAV, FLAC, MP3) en mémoire
+     * Lance le décodage du fichier audio dans un thread détaché d'ImGui
      */
-    bool LoadAudioFile(const std::string& filename) {
-        isAudioLoaded = false;
-        currentFilePath = filename;
-        
-        std::string ext = filename.substr(filename.find_last_of(".") + 1);
-        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    bool StartAsyncLoad(const std::string& filename) {
+        if (isFileLoading) return false; // Déjà un chargement en cours
 
-        if (ext == "wav") {
-            drwav wav;
-            if (!drwav_init_file(&wav, filename.c_str(), nullptr)) return false;
-            std::vector<float> tempBuffer(wav.totalPCMFrameCount * wav.channels);
-            drwav_read_pcm_frames_f32(&wav, wav.totalPCMFrameCount, tempBuffer.data());
-            sampleRate = wav.sampleRate;
-            channelsCount = wav.channels;
-            totalSampleCount = wav.totalPCMFrameCount;
-            ProcessInterleavedFrames(tempBuffer.data(), wav.totalPCMFrameCount, wav.channels);
-            drwav_uninit(&wav);
-            return true;
-        } 
-        else if (ext == "flac") {
-            drflac* pFlac = drflac_open_file(filename.c_str(), nullptr);
-            if (!pFlac) return false;
-            std::vector<float> tempBuffer(pFlac->totalPCMFrameCount * pFlac->channels);
-            drflac_read_pcm_frames_f32(pFlac, pFlac->totalPCMFrameCount, tempBuffer.data());
-            sampleRate = pFlac->sampleRate;
-            channelsCount = pFlac->channels;
-            totalSampleCount = pFlac->totalPCMFrameCount;
-            ProcessInterleavedFrames(tempBuffer.data(), pFlac->totalPCMFrameCount, pFlac->channels);
-            drflac_close(pFlac);
-            return true;
+        // Nettoyer les erreurs précédentes
+        lastLoadingError = "";
+        isFileLoading = true;
+
+        // Si un thread précédent est resté actif, on le libère proprement
+        if (loadingThread.joinable()) {
+            loadingThread.join();
         }
-        else if (ext == "mp3") {
-            drmp3 mp3;
-            if (!drmp3_init_file(&mp3, filename.c_str(), nullptr)) return false;
-            uint64_t totalFrames = mp3.totalPCMFrameCount; 
-            std::vector<float> tempBuffer(totalFrames * mp3.channels);
-            drmp3_read_pcm_frames_f32(&mp3, totalFrames, tempBuffer.data());
-            sampleRate = mp3.sampleRate;
-            channelsCount = mp3.channels;
-            totalSampleCount = totalFrames;
-            ProcessInterleavedFrames(tempBuffer.data(), totalSampleCount, mp3.channels);
-            drmp3_uninit(&mp3);
-            return true;
-        }
-        
-        currentFilePath = "Format non supporté";
-        return false;
+
+        // Lancement du thread asynchrone C++
+        loadingThread = std::thread(&AudioVisualizerWithTrigger::InternalLoadTrack, this, filename);
+        return true;
     }
 
-    /**
-     * Sépare les canaux entrelacés et initialise le périphérique de sortie audio SDL3
-     */
-    void ProcessInterleavedFrames(const float* buffer, unsigned long long frameCount, unsigned int channels) 
+    void ProcessInterleavedFrames(const float* buffer, unsigned long long frameCount, unsigned int channels, const AudioTrack& track) 
     {
         channelLeft.clear();
         channelRight.clear();
@@ -157,38 +260,31 @@ public:
             if (channels >= 2) {
                 channelLeft.push_back(buffer[i * channels]);
                 channelRight.push_back(buffer[i * channels + 1]);
-            } else { // Fichier Mono
+            } else {
                 channelLeft.push_back(buffer[i]);
                 channelRight.push_back(buffer[i]);
             }
         }
 
-        // Configuration matérielle de la lecture audio via SDL3
         CleanAudioStream();
+        sampleRate = track.sampleRate;
+        channelsCount = track.channels;
+        totalSampleCount = track.totalFrames;
+
         SDL_AudioSpec srcSpec = { SDL_AUDIO_F32, (int)channels, (int)sampleRate };
         audioStream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &srcSpec, nullptr, nullptr);
         
-        if (audioStream) {
-            // Remplir le tampon matériel et démarrer immédiatement le flux
+        if (audioStream) 
+        {
             SDL_PutAudioStreamData(audioStream, buffer, (int)(frameCount * channels * sizeof(float)));
-            if (!isPlaybackPaused) {
-                SDL_ResumeAudioStreamDevice(audioStream);
-            }
-        } else {
-            std::cerr << "Erreur d'ouverture du périphérique audio SDL3 : " << SDL_GetError() << std::endl;
+            if (!isPlaybackPaused) SDL_ResumeAudioStreamDevice(audioStream);
         }
-
         isAudioLoaded = true;
         currentPlaybackPos = 0;
         ReallocateTriggers();
     }
-
-    /**
-     * Génère l'analyse de synchronisation de phase et trace l'oscilloscope stabilisé
-     */
     void DrawTriggeredOscilloscope(const char* label, const std::vector<float>& channelData, 
-                                   CorrelationTrigger& triggerObj, ImVec2 size, ImU32 color) 
-    {
+                                   CorrelationTrigger& triggerObj, ImVec2 size, ImU32 color) {
         ImGui::Text("%s", label);
         ImVec2 p0 = ImGui::GetCursorScreenPos();
         ImVec2 p1 = ImVec2(p0.x + size.x, p0.y + size.y);
@@ -197,39 +293,35 @@ public:
         drawList->AddRectFilled(p0, p1, IM_COL32(15, 15, 15, 255));
         drawList->AddLine(ImVec2(p0.x, p0.y + size.y / 2.0f), ImVec2(p1.x, p0.y + size.y / 2.0f), IM_COL32(45, 45, 45, 255));
 
-        if (channelData.empty()) {
-            ImGui::Dummy(size);
-            return;
+        if (channelData.empty()) { 
+            ImGui::Dummy(size); 
+            return; 
         }
 
-        // 1. Calcul du point d'accroche stable via le déclencheur de corrélation croisée
         TriggerResult tr = triggerObj.get_trigger(channelData, currentPlaybackPos, 120);
         int stableStartIndex = tr.trigger;
 
-        // 2. Traitement mathématique et mise à jour dynamique du tampon historique (TriggerBufferUpdate)
         CorrelationTrigger::PerFrameCache cache;
-        float sum = 0.0f;
+        float sum = 0.0f; 
         int count = 0;
         for (int i = 0; i < uiTsamp; ++i) {
             size_t idx = stableStartIndex + i;
-            if (idx < channelData.size()) {
-                sum += channelData[idx];
-                count++;
+            if (idx < channelData.size()) { 
+                sum += channelData[idx]; 
+                count++; 
             }
         }
         cache.result_mean = (count > 0) ? (sum / count) : 0.0f;
-        cache.period = 40.0f; // Valeur par défaut pour l'écart-type de la Gaussienne
+        cache.period = 40.0f; 
 
         std::vector<float> mathSegment(uiTsamp, 0.0f);
         for (int i = 0; i < uiTsamp; ++i) {
             size_t idx = stableStartIndex + i;
-            if (idx < channelData.size()) {
-                mathSegment[i] = channelData[idx];
-            }
+            if (idx < channelData.size()) mathSegment[i] = channelData[idx];
         }
         triggerObj._update_buffer(mathSegment, cache);
 
-        // 3. Rendu géométrique de la forme d'onde avec Downsampling Min/Max anti-aliasing
+        // CORRECTION : static_cast<int> et static_cast<float> corrigés ici
         int widthPixels = static_cast<int>(size.x);
         float samplesPerPixel = static_cast<float>(viewWindowSize) / size.x;
         float midY = p0.y + (size.y / 2.0f);
@@ -237,9 +329,8 @@ public:
         for (int x = 0; x < widthPixels - 1; ++x) {
             size_t startOffset = static_cast<size_t>(x * samplesPerPixel);
             size_t endOffset = static_cast<size_t>((x + 1) * samplesPerPixel);
-
-            float minVal = 0.0f;
-            float maxVal = 0.0f;
+            float minVal = 0.0f; 
+            float maxVal = 0.0f; 
             bool hasData = false;
 
             for (size_t s = startOffset; s < endOffset && s < static_cast<size_t>(viewWindowSize); ++s) {
@@ -255,7 +346,6 @@ public:
                     }
                 }
             }
-
             float yTop = midY - (maxVal * (size.y / 2.0f));
             float yBottom = midY - (minVal * (size.y / 2.0f));
             drawList->AddLine(ImVec2(p0.x + x, yTop), ImVec2(p0.x + x, yBottom), color, 1.5f);
@@ -263,27 +353,62 @@ public:
         ImGui::Dummy(size);
     }
 
-    /**
-     * Construit et restitue la vue de l'interface utilisateur ImGui à chaque itération
-     */
     void RenderUI() 
     {
         ImGui::Begin("Oscilloscope Audio Synchronisé (SIMD Trigger)");
 
-        // Explorateur de fichiers
-        ImGui::Text("Fichier actuel : %s", currentFilePath.c_str());
+        // 1. GESTION DU BANDEAU D'ARRIÈRE-PLAN
+        if (isFileLoading.load()) {
+            ImGui::TextColored(ImVec4(0.0f, 1.0f, 1.0f, 1.0f), "🔄 Loading file... Veuillez patienter.");
+            ImGui::SameLine();
+            ImGui::TextDisabled("(Le décodage s'exécute de façon asynchrone sur un thread CPU)");
+        } else if (!lastLoadingError.empty()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.2f, 1.0f), "❌ Erreur : %s", lastLoadingError.c_str());
+        } else {
+            ImGui::Text("Fichier actuel : %s", currentFilePath.c_str());
+        }
+
         ImGui::SameLine();
-        if (ImGui::Button("Parcourir...")) {
-            fileDialog.Open();
+        if (ImGui::Button("Importer un nouveau fichier...")) {
+            if (!isFileLoading.load()) fileDialog.Open();
         }
 
         ImGui::Separator();
 
-        if (isAudioLoaded) {
-            // Informations fichier
-            ImGui::Text("Fréquence : %u Hz | Canaux : %u | Taille : %llu échantillons",
-                        sampleRate, channelsCount, totalSampleCount);
+        // 2. BANQUE DE LECTURE (TREEVIEW DE LA PLAYLIST)
+        ImGui::Text("Bibliothèque de morceaux chargés :");
+        ImVec2 treeSize(ImGui::GetContentRegionAvail().x, 120.0f);
+        
+        ImGui::BeginChild("TreeViewChild", treeSize, true);
+        if (ImGui::TreeNodeEx("Mes Fichiers Audio", ImGuiTreeNodeFlags_DefaultOpen)) 
+        {
+            for (size_t i = 0; i < playlist.size(); ++i) {
+                const auto& track = playlist[i];
+                
+                std::string bitDepthInfo = (track.bitDepth > 0) ? std::to_string(track.bitDepth) + "-bit" : "VBR";
+                std::string chInfo = (track.channels == 2) ? "Stéréo" : (track.channels == 1 ? "Mono" : std::to_string(track.channels) + "ch");
+                std::string itemText = track.fileName + " [" + chInfo + " | " + track.durationStr + " | " + bitDepthInfo + "]";
+                
+                ImGuiTreeNodeFlags nodeFlags = ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+                
+                // CORRECTION : static_cast<int> réintégré
+                if (static_cast<int>(i) == selectedTrackIndex) nodeFlags |= ImGuiTreeNodeFlags_Selected;
 
+                ImGui::TreeNodeEx((void*)(intptr_t)i, nodeFlags, "%s", itemText.c_str());
+                
+                if (ImGui::IsItemClicked() && !isFileLoading.load()) {
+                    // CORRECTION : static_cast<int> réintégré
+                    selectedTrackIndex = static_cast<int>(i);
+                    StartAsyncLoad(track.filePath);
+                }
+            }
+            ImGui::TreePop();
+        }
+        ImGui::EndChild();
+
+        ImGui::Separator();
+
+        if (isAudioLoaded) {
             // --- CURSEURS INTERACTIFS DES PARAMÈTRES (441, 1024, 1) ---
             if (ImGui::CollapsingHeader("Configuration Avancée du Déclencheur", ImGuiTreeNodeFlags_DefaultOpen)) {
                 bool triggerParamsChanged = false;
@@ -293,15 +418,12 @@ public:
                     triggerParamsChanged = true;
                 }
                 if (ImGui::SliderInt("Sous-échantillonnage (stride)", &uiStride, 1, 8, "1/%d")) triggerParamsChanged = true;
-
-                if (triggerParamsChanged) {
-                    ReallocateTriggers();
-                }
+                if (triggerParamsChanged) ReallocateTriggers();
             }
 
             ImGui::Separator();
 
-            // --- CONTRÔLES DE LECTURE AUDIO ---
+            // --- CONTRÔLES DE LECTURE ---
             if (ImGui::Button(isPlaybackPaused ? "Reprendre" : "Pause")) {
                 isPlaybackPaused = !isPlaybackPaused;
                 if (audioStream) {
@@ -310,50 +432,35 @@ public:
                 }
             }
             ImGui::SameLine();
-            if (ImGui::Button("Reset Position")) {
-                currentPlaybackPos = 0;
-            }
+            if (ImGui::Button("Reset Position")) currentPlaybackPos = 0;
 
-            // Avancement de la tête de lecture selon le timing matériel
             if (!isPlaybackPaused) {
                 currentPlaybackPos += samplesPerFrame;
-                // CORRECTION 1 : Ajout de <int> pour le static_cast
-                if (currentPlaybackPos >= static_cast<int>(channelLeft.size())) {
-                    currentPlaybackPos = 0; // Boucler au début du fichier
-                }
+                // CORRECTION : static_cast<int> réintégré
+                if (currentPlaybackPos >= static_cast<int>(channelLeft.size())) currentPlaybackPos = 0;
             }
 
-            // Slider de Zoom et barre de progression
             ImGui::SliderInt("Fenêtre d'affichage (Zoom)", &viewWindowSize, 256, 4096, "%d samples");
-
-            // CORRECTION 2 : Ajout de <float> pour le static_cast
+            
+            // CORRECTION : static_cast<float> réintégré
             float progress = static_cast<float>(currentPlaybackPos) / channelLeft.size();
             ImGui::ProgressBar(progress, ImVec2(-1.0f, 0.0f));
 
-            // Rendu graphique des canaux séparés Gauche / Droite
             ImVec2 widgetSize(ImGui::GetContentRegionAvail().x, 160.0f);
             ImGui::Spacing();
-            DrawTriggeredOscilloscope("Canal GAUCHE (L) - Stabilisé via SIMD", channelLeft, *triggerLeft, widgetSize, IM_COL32(0, 255, 200, 255));
+            DrawTriggeredOscilloscope("Canal GAUCHE (L) - Aligné SIMD", channelLeft, *triggerLeft, widgetSize, IM_COL32(0, 255, 200, 255));
             ImGui::Spacing();
-            DrawTriggeredOscilloscope("Canal DROIT (R) - Stabilisé via SIMD", channelRight, *triggerRight, widgetSize, IM_COL32(255, 180, 0, 255));
+            DrawTriggeredOscilloscope("Canal DROIT (R) - Aligné SIMD", channelRight, *triggerRight, widgetSize, IM_COL32(255, 180, 0, 255));
         } else {
-            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.3f, 1.0f), "Veuillez charger un fichier pour démarrer l'analyse de phase.");
+            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.3f, 1.0f), "Veuillez importer un fichier pour démarrer l'analyse de phase.");
         }
 
         ImGui::End();
 
-        // Rendu impératif et gestion de la sélection d'imgui-filebrowser
         fileDialog.Display();
         if (fileDialog.HasSelected()) {
-            LoadAudioFile(fileDialog.GetSelected().string());
+            StartAsyncLoad(fileDialog.GetSelected().string());
             fileDialog.ClearSelected();
         }
     }
-
 };
-
-
-
-
-
-
