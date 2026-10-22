@@ -1,47 +1,67 @@
-cmake_minimum_required(VERSION 3.25)
-project(AudioVisualizerSIMD VERSION 1.0.0 LANGUAGES C CXX)
 
-# Force l'utilisation de la norme C++26
-set(CMAKE_CXX_STANDARD 26)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
+cmake_minimum_required(VERSION 3.24)
+project(AudioVisualizerSIMD CXX)
 
-# Options d'optimisation globales pour les performances audio/SIMD
-if(MSVC)
-    add_compile_options(/O2 /arch:AVX2 /openmp:experimental)
-else()
-    add_compile_options(-O3 -march=native -fopenmp-simd)
+# =================================================================
+# 1. GESTION STRICTE DU MODE DE BUILD & PURGE DES DRAPEAUX PAR DÉFAUT
+# =================================================================
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE "Debug" CACHE STRING "Options: Debug Release" FORCE)
 endif()
 
-# ---------------------------------------------------------------------
-# Recherche des dépendances locales (SDL3 et OpenGL)
-# ---------------------------------------------------------------------
-find_package(SDL3 REQUIRED)
-find_package(OpenGL REQUIRED)
+message(STATUS "🔧 Mode de build actif : ${CMAKE_BUILD_TYPE}")
 
-# ---------------------------------------------------------------------
-# Téléchargement automatique de Dear ImGui via FetchContent
-# ---------------------------------------------------------------------
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    message(STATUS "🧼 Mode Debug : Purge totale des variables d'optimisation par défaut...")
+    
+    # Écrasement forcé des variables de cache pour empêcher la concaténation système
+    set(CMAKE_CXX_FLAGS_DEBUG "" CACHE STRING "Flags Debug" FORCE)
+    set(CMAKE_C_FLAGS_DEBUG "" CACHE STRING "Flags Debug" FORCE)
+    
+    # Injection stricte des drapeaux de débogage (ZÉRO -O3, ZÉRO -march=native)
+    set(CMAKE_CXX_FLAGS_DEBUG "-g3 -O0 -Wall -Wextra" CACHE STRING "Flags Debug" FORCE)
+else()
+    # Mode Release : Optimisations maximales pour le DSP audio
+    set(CMAKE_CXX_FLAGS_RELEASE "" CACHE STRING "Flags Release" FORCE)
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG" CACHE STRING "Flags Release" FORCE)
+endif()
+
+# Configuration globale commune
+set(CMAKE_CXX_STANDARD 26)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_FLAGS "-fdiagnostics-color=always" CACHE STRING "Flags Globaux" FORCE)
+
+# =================================================================
+# 2. RECHERCHE DES DEPENDANCES SYSTEME (SDL3 & OpenMP)
+# =================================================================
+# Recherche de OpenMP pour la vectorisation #pragma omp simd
+find_package(OpenMP REQUIRED)
+
+# Recherche de SDL3 installé sur le système
+find_package(SDL3 REQUIRED)
+
+# =================================================================
+# 3. TELECHARGEMENT ET CONFIGURATION DE DEAR IMGUI (FetchContent)
+# =================================================================
 include(FetchContent)
 
+# Téléchargement de Dear ImGui
 FetchContent_Declare(
     imgui
-    GIT_REPOSITORY https://github.com/ocornut/imgui.git
-    GIT_TAG        v1.91.5 # Version stable recommandée (ou 'docking' selon vos besoins)
+    GIT_REPOSITORY  https://github.com/ocornut/imgui.git
+    GIT_TAG        master # À ajuster selon la version souhaitée
 )
-
-# Récupération du contenu du dépôt
 FetchContent_MakeAvailable(imgui)
 
+# Téléchargement du FileBrowser pour ImGui
 FetchContent_Declare(
     imgui_filebrowser
     GIT_REPOSITORY https://github.com/AirGuanZ/imgui-filebrowser.git
     GIT_TAG        master
 )
+FetchContent_MakeAvailable(imgui_filebrowser)
 
-FetchContent_MakeAvailable(imgui imgui_filebrowser)
-
-# Création de la bibliothèque intermédiaire d'ImGui
+# Création d'une bibliothèque statique pour ImGui afin d'isoler ses sources
 add_library(imgui_lib STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_demo.cpp
@@ -52,35 +72,47 @@ add_library(imgui_lib STATIC
     ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
 )
 
-# On indique à CMake où trouver imfilebrowser.h ainsi que les headers imgui
 target_include_directories(imgui_lib PUBLIC 
-    ${imgui_SOURCE_DIR} 
+    ${imgui_SOURCE_DIR}
     ${imgui_SOURCE_DIR}/backends
-    ${imgui_filebrowser_SOURCE_DIR} # <-- Ajout du dossier d'inclusion du filebrowser
+    ${imgui_filebrowser_SOURCE_DIR}
 )
-target_link_libraries(imgui_lib PRIVATE SDL3::SDL3 OpenGL::GL)
 
+# Appliquer les drapeaux OpenMP à ImGui si nécessaire
+target_link_libraries(imgui_lib PRIVATE OpenMP::OpenMP_CXX)
 
-# ---------------------------------------------------------------------
-# Cible principale (Votre exécutable)
-# ---------------------------------------------------------------------
-set(PROJECT_SOURCES
+# =================================================================
+# 4. CONFIGURATION DE L'EXECUTABLE PRINCIPAL
+# =================================================================
+# Déclaration de votre exécutable (cible finale appelée par build.sh)
+add_executable(AudioVisualizerSIMD 
     main.cpp
 )
 
-add_executable(${PROJECT_NAME} ${PROJECT_SOURCES})
+# Inclusion des répertoires de votre projet
+target_include_directories(AudioVisualizerSIMD PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
-# Inclusion des répertoires locaux et de la bibliothèque ImGui créée
-target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-
-# Liaison de votre exécutable avec la bibliothèque ImGui et les composants système
-target_link_libraries(${PROJECT_NAME} PRIVATE
+# Liens vers les bibliothèques indispensables
+target_link_libraries(AudioVisualizerSIMD PRIVATE 
     imgui_lib
     SDL3::SDL3
-    OpenGL::GL
+    OpenMP::OpenMP_CXX
 )
 
-# Activation d'OpenMP pour l'étape de linkage (requis hors MSVC)
-if(NOT MSVC)
-    target_link_options(${PROJECT_NAME} PRIVATE -fopenmp-simd)
+# Liens pour le rendu graphique (OpenGL sous Linux)
+if(UNIX AND NOT APPLE)
+    target_link_libraries(AudioVisualizerSIMD PRIVATE GL)
 endif()
+
+# =================================================================
+# 5. NETTOYAGE CHIRURGICAL ET ASSIGNATION DES OPTIONS SUR LES CIBLES
+# =================================================================
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    # Forcer la désactivation de toute optimisation résiduelle sur l'exécutable
+    target_compile_options(AudioVisualizerSIMD PRIVATE -g3 -O0)
+    
+    # Forcer la désactivation de toute optimisation sur la lib ImGui
+    target_compile_options(imgui_lib PRIVATE -g3 -O0)
+    set_target_properties(imgui_lib PROPERTIES COMPILE_FLAGS "-g3 -O0")
+endif()
+

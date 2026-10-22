@@ -1,0 +1,37 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Analyse Audio (Débogage Actif)",
+            "type": "cppdbg",
+            "request": "launch",
+            // Remplacez "main" par le nom exact de votre exécutable cible
+            "program": "${workspaceFolder}/build/AudioVisualizerSIMD",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            // Configuration spécifique à l'OS
+            "windows": {
+                "program": "${workspaceFolder}/build/Debug/AudioVisualizerSIMD.exe", // Chemin classique si vous utilisez CMake sur Windows
+                "MIMode": "gdb", // Changez par "lldb" ou "vsdbg" si vous utilisez MSVC
+                "miDebuggerPath": "C:\\msys64\\ucrt64\\bin\\gdb.exe" // À ajuster selon le chemin de votre compilateur (ex: MinGW/MSYS2)
+            },
+            "linux": {
+                "MIMode": "gdb",
+                "miDebuggerPath": "/usr/bin/gdb",
+                "setupCommands": [
+                    {
+                        "description": "Activer le formatage automatique des conteneurs STL (Pretty-printing)",
+                        "text": "-enable-pretty-printing",
+                        "ignoreFailures": true
+                    }
+                ]
+            },
+            "osx": {
+                "MIMode": "lldb"
+            }
+        }
+    ]
+}
